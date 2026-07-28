@@ -142,6 +142,7 @@ mod tests {
     fn project(id: &str, description: &str) -> Project {
         Project {
             id: id.into(),
+            name: String::new(),
             description: description.into(),
         }
     }

@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use crate::dag::Dag;
+use crate::graph;
 use crate::sync;
 use crate::todoist::Client;
 
@@ -43,12 +45,19 @@ pub struct Oauth {
 struct AppState {
     client: Arc<Client>,
     oauth: Oauth,
+    /// Shared secret for the read-only /graph view; None disables it.
+    graph_key: Option<String>,
     /// CSRF state for the in-flight OAuth attempt, if any.
     pending_state: Mutex<Option<String>>,
     kick: mpsc::Sender<()>,
 }
 
-pub async fn serve(bind: &str, client: Arc<Client>, oauth: Oauth) -> Result<()> {
+pub async fn serve(
+    bind: &str,
+    client: Arc<Client>,
+    oauth: Oauth,
+    graph_key: Option<String>,
+) -> Result<()> {
     if oauth.client_secret.is_empty() {
         tracing::warn!(
             "TODOIST_CLIENT_SECRET is empty — all webhooks will be rejected until it is set"
@@ -82,14 +91,20 @@ pub async fn serve(bind: &str, client: Arc<Client>, oauth: Oauth) -> Result<()> 
         }
     });
 
+    if graph_key.is_none() {
+        tracing::info!("TACHE_GRAPH_KEY is not set — /graph is disabled");
+    }
+
     let state = Arc::new(AppState {
         client,
         oauth,
+        graph_key,
         pending_state: Mutex::new(None),
         kick,
     });
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/graph", get(graph_view))
         .route("/todoist-hook", post(hook))
         .route("/oauth/start", get(oauth_start))
         .route("/oauth/callback", get(oauth_callback))
@@ -114,6 +129,44 @@ async fn hook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Byte
     }
     let _ = state.kick.try_send(());
     StatusCode::OK
+}
+
+async fn graph_view(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(key) = &state.graph_key else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TACHE_GRAPH_KEY is not set — graph view disabled",
+        )
+            .into_response();
+    };
+    if params.get("key") != Some(key) {
+        return (StatusCode::FORBIDDEN, "missing or bad ?key=").into_response();
+    }
+    match render_graph(&state.client).await {
+        Ok(html) => axum::response::Html(html).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("todoist fetch failed: {e}")).into_response(),
+    }
+}
+
+async fn render_graph(client: &Client) -> Result<String> {
+    let projects = client.active_projects().await?;
+    let enabled = sync::enabled_ids(&projects);
+    let tasks: Vec<_> = client
+        .active_tasks()
+        .await?
+        .into_iter()
+        .filter(|t| enabled.contains(&t.project_id))
+        .collect();
+    let dag = Dag::build(&tasks);
+    let classes = dag.classify(&tasks);
+    let scoped: Vec<_> = projects
+        .into_iter()
+        .filter(|p| enabled.contains(&p.id))
+        .collect();
+    Ok(graph::page(&scoped, &tasks, &dag, &classes))
 }
 
 async fn oauth_start(State(state): State<Arc<AppState>>) -> axum::response::Response {

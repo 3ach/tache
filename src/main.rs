@@ -1,4 +1,5 @@
 mod dag;
+mod graph;
 mod server;
 mod sync;
 mod todoist;
@@ -62,7 +63,8 @@ async fn main() -> Result<()> {
             client_secret: std::env::var("TODOIST_CLIENT_SECRET").unwrap_or_default(),
             token_file: token_file(),
         };
-        return server::serve(bind, client, oauth).await;
+        let graph_key = std::env::var("TACHE_GRAPH_KEY").ok().filter(|k| !k.is_empty());
+        return server::serve(bind, client, oauth, graph_key).await;
     }
 
     let client = Client::new(resolve_token().context(
@@ -153,16 +155,24 @@ async fn main() -> Result<()> {
             } else {
                 // verify the prereq resolves before writing it
                 let p = find_unique(tasks, &prereq)?;
-                if p.project_id != target.project_id {
-                    bail!("'{}' and '{}' are in different projects", target.content, p.content);
-                }
+                let cross_project = p.project_id != target.project_id;
                 let mut desc = target.description.clone();
                 if !desc.is_empty() {
                     desc.push('\n');
                 }
-                desc.push_str(&format!("after: {}", p.content));
+                // name references only resolve within one project; cross-project
+                // edges are written by id, which resolves anywhere
+                if cross_project {
+                    desc.push_str(&format!("after: {}", p.id));
+                } else {
+                    desc.push_str(&format!("after: {}", p.content));
+                }
                 client.set_description(&target.id, &desc).await?;
-                println!("added: {} after {}", target.content, p.content);
+                if cross_project {
+                    println!("added: {} after {} (cross-project, by id)", target.content, p.content);
+                } else {
+                    println!("added: {} after {}", target.content, p.content);
+                }
             }
         }
     }

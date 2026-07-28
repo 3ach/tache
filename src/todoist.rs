@@ -33,6 +33,8 @@ struct TasksPage {
 pub struct Project {
     pub id: String,
     #[serde(default)]
+    pub name: String,
+    #[serde(default)]
     pub description: String,
 }
 
