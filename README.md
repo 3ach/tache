@@ -12,6 +12,10 @@ unblocked frontier on every change and maintains two labels:
 - `blocked` — waiting on an active prerequisite, an ambiguous reference,
   or a cycle
 
+Scoping is opt-in per project: put `#dag` anywhere in a project's
+description and tache manages it. Tasks in unmarked projects are ignored,
+except stale `next`/`blocked` labels get stripped.
+
 The "custom view" is then a plain Todoist filter, which works in every
 official app:
 

@@ -69,10 +69,12 @@ pub async fn serve(bind: &str, client: Arc<Client>, oauth: Oauth) -> Result<()> 
             while kicked.try_recv().is_ok() {}
             match sync::reconcile(&worker_client).await {
                 Ok(r) => tracing::info!(
-                    total = r.total,
+                    scoped = r.scoped,
+                    projects = r.projects,
                     next = r.next,
                     blocked = r.blocked,
                     relabeled = r.relabeled,
+                    stripped = r.stripped,
                     "reconciled"
                 ),
                 Err(e) => tracing::error!(error = %e, "reconcile failed"),

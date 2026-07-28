@@ -29,6 +29,19 @@ struct TasksPage {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Project {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectsPage {
+    results: Vec<Project>,
+    next_cursor: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -121,6 +134,34 @@ impl Client {
             }
         }
         Ok(tasks)
+    }
+
+    pub async fn active_projects(&self) -> Result<Vec<Project>> {
+        let mut projects = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut req = self
+                .http
+                .get(format!("{BASE}/projects"))
+                .bearer_auth(self.bearer())
+                .query(&[("limit", "200")]);
+            if let Some(c) = &cursor {
+                req = req.query(&[("cursor", c)]);
+            }
+            let page: ProjectsPage = req
+                .send()
+                .await?
+                .error_for_status()
+                .context("fetching projects")?
+                .json()
+                .await?;
+            projects.extend(page.results);
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(projects)
     }
 
     pub async fn set_labels(&self, task_id: &str, labels: &[String]) -> Result<()> {

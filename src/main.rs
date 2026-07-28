@@ -82,20 +82,25 @@ async fn main() -> Result<()> {
         Command::Sync => {
             let report = sync::reconcile(&client).await?;
             println!(
-                "{} tasks: {} next, {} blocked, {} relabeled",
-                report.total, report.next, report.blocked, report.relabeled
+                "{} tasks in {} #dag projects: {} next, {} blocked, {} relabeled, {} stripped",
+                report.scoped,
+                report.projects,
+                report.next,
+                report.blocked,
+                report.relabeled,
+                report.stripped
             );
             if !report.unresolved.is_empty() || !report.ambiguous.is_empty() || report.cycles > 0 {
                 println!("run `tache doctor` — graph has warnings");
             }
         }
         Command::Frontier => {
-            let tasks = client.active_tasks().await?;
+            let tasks = sync::Scope::fetch(&client).await?.enabled_tasks();
             let dag = Dag::build(&tasks);
             print!("{}", sync::format_frontier(&tasks, &dag.classify(&tasks)));
         }
         Command::Graph => {
-            let tasks = client.active_tasks().await?;
+            let tasks = sync::Scope::fetch(&client).await?.enabled_tasks();
             let dag = Dag::build(&tasks);
             let name = |id: &str| {
                 tasks
@@ -111,7 +116,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Doctor => {
-            let tasks = client.active_tasks().await?;
+            let tasks = sync::Scope::fetch(&client).await?.enabled_tasks();
             let dag = Dag::build(&tasks);
             let name = |id: &str| {
                 tasks
@@ -131,8 +136,15 @@ async fn main() -> Result<()> {
             }
         }
         Command::Dep { task, prereq, rm } => {
-            let tasks = client.active_tasks().await?;
-            let target = find_unique(&tasks, &task)?;
+            let scope = sync::Scope::fetch(&client).await?;
+            let tasks = &scope.tasks;
+            let target = find_unique(tasks, &task)?;
+            if !scope.enabled_projects.contains(&target.project_id) {
+                println!(
+                    "note: this project is not #dag-enabled — add '{}' to its description",
+                    sync::DAG_MARKER
+                );
+            }
             if rm {
                 let needle = prereq.to_lowercase();
                 let new_desc: String = target
@@ -148,7 +160,7 @@ async fn main() -> Result<()> {
                 println!("removed: {} after {}", target.content, prereq);
             } else {
                 // verify the prereq resolves before writing it
-                let p = find_unique(&tasks, &prereq)?;
+                let p = find_unique(tasks, &prereq)?;
                 if p.project_id != target.project_id {
                     bail!("'{}' and '{}' are in different projects", target.content, p.content);
                 }
