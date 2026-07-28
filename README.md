@@ -3,8 +3,9 @@
 Task dependencies (a DAG) layered over Todoist, which has none natively.
 
 Edges are stored inside Todoist itself as `after:` lines in a task's
-description (`after: buy lumber` — resolved by id, exact name, or unique
-substring within the same project). A webhook-driven server recomputes the
+description (`after: buy lumber` — resolved by id across all managed
+projects, or by exact name or unique substring within the same
+project). A webhook-driven server recomputes the
 unblocked frontier on every change and maintains two labels:
 
 - `next` — every prerequisite is complete; actionable now (includes

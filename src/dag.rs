@@ -2,8 +2,8 @@
 //!
 //! Edges live inside Todoist itself, as `after:` lines in a task's
 //! description — e.g. `after: buy lumber` or `after: sand boards, buy lumber`.
-//! References are resolved against active tasks in the same project, by
-//! task id, exact name, or unique case-insensitive substring.
+//! References are resolved against active tasks: by task id anywhere, or by
+//! exact name / unique case-insensitive substring within the same project.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,9 +40,13 @@ pub fn parse_refs(description: &str) -> Vec<String> {
         .collect()
 }
 
-/// Resolve a reference to an active task within one project.
-fn resolve<'a>(reference: &str, project_tasks: &[&'a Task]) -> Resolution<'a> {
-    if let Some(t) = project_tasks.iter().find(|t| t.id == reference) {
+/// Resolve a reference: by task id anywhere, then by name within one project.
+fn resolve<'a>(
+    reference: &str,
+    project_tasks: &[&'a Task],
+    by_id: &HashMap<&str, &'a Task>,
+) -> Resolution<'a> {
+    if let Some(t) = by_id.get(reference) {
         return Resolution::One(t);
     }
     let needle = reference.to_lowercase();
@@ -78,12 +82,13 @@ impl Dag {
         for t in tasks {
             by_project.entry(t.project_id.as_str()).or_default().push(t);
         }
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
         let mut dag = Dag::default();
         for t in tasks {
             let siblings = &by_project[t.project_id.as_str()];
             for reference in parse_refs(&t.description) {
-                match resolve(&reference, siblings) {
+                match resolve(&reference, siblings, &by_id) {
                     Resolution::One(p) if p.id != t.id => dag
                         .prereqs
                         .entry(t.id.clone())
@@ -226,6 +231,28 @@ mod tests {
         assert_eq!(classes["11"], LABEL_BLOCKED);
         assert_eq!(classes["12"], LABEL_BLOCKED);
         assert!(dag.unresolved.is_empty());
+    }
+
+    #[test]
+    fn resolves_id_across_projects() {
+        let mut prereq = task("40", "install cabinets", "");
+        prereq.project_id = "p2".into();
+        let tasks = vec![prereq, task("41", "game hutch", "after: 40")];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        assert_eq!(classes["41"], LABEL_BLOCKED);
+        assert!(dag.unresolved.is_empty());
+    }
+
+    #[test]
+    fn name_reference_stays_project_scoped() {
+        let mut other = task("50", "paint fence", "");
+        other.project_id = "p2".into();
+        let tasks = vec![other, task("51", "hang gate", "after: paint fence")];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        assert_eq!(classes["51"], LABEL_NEXT);
+        assert_eq!(dag.unresolved.len(), 1);
     }
 
     #[test]
