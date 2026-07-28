@@ -87,7 +87,7 @@ pub async fn serve(bind: &str, client: Arc<Client>, oauth: Oauth) -> Result<()> 
         kick,
     });
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/health", get(|| async { "ok" }))
         .route("/todoist-hook", post(hook))
         .route("/oauth/start", get(oauth_start))
         .route("/oauth/callback", get(oauth_callback))

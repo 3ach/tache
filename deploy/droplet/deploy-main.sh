@@ -34,7 +34,7 @@ echo "==> waiting for ${NAME} to become ready"
 deadline=$(( $(date +%s) + 120 ))
 ready=0
 while [[ $(date +%s) -lt $deadline ]]; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${PORT}/healthz" || echo 000)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${PORT}/health" || echo 000)
   if [[ "$code" == "200" ]]; then
     ready=1
     break
