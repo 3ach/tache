@@ -89,12 +89,16 @@ pub async fn reconcile(client: &Client) -> Result<Report> {
         };
         if desired != task.labels {
             client.set_labels(&task.id, &desired).await?;
-            if classes.contains_key(&task.id) {
-                report.relabeled += 1;
-            } else {
-                report.stripped += 1;
+            match classes.get(&task.id) {
+                Some(&class) => {
+                    report.relabeled += 1;
+                    tracing::info!(task = %task.content, label = class, "relabeled");
+                }
+                None => {
+                    report.stripped += 1;
+                    tracing::info!(task = %task.content, "stripped");
+                }
             }
-            tracing::info!(task = %task.content, "relabeled");
         }
     }
     Ok(report)

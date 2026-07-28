@@ -62,12 +62,6 @@ impl Client {
         }
     }
 
-    pub fn from_env() -> Result<Self> {
-        let token = std::env::var("TODOIST_API_TOKEN")
-            .context("TODOIST_API_TOKEN is not set (see .env.example)")?;
-        Ok(Self::new(token))
-    }
-
     pub fn has_token(&self) -> bool {
         !self.token.read().unwrap().is_empty()
     }
