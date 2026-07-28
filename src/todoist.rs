@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::sync::RwLock;
 
 const BASE: &str = "https://api.todoist.com/api/v1";
 
@@ -28,16 +29,23 @@ struct TasksPage {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+}
+
+/// The token sits behind a lock so the OAuth callback can swap in a fresh
+/// one on a live server.
 pub struct Client {
     http: reqwest::Client,
-    token: String,
+    token: RwLock<String>,
 }
 
 impl Client {
     pub fn new(token: String) -> Self {
         Self {
             http: reqwest::Client::new(),
-            token,
+            token: RwLock::new(token),
         }
     }
 
@@ -45,6 +53,43 @@ impl Client {
         let token = std::env::var("TODOIST_API_TOKEN")
             .context("TODOIST_API_TOKEN is not set (see .env.example)")?;
         Ok(Self::new(token))
+    }
+
+    pub fn has_token(&self) -> bool {
+        !self.token.read().unwrap().is_empty()
+    }
+
+    pub fn set_token(&self, token: String) {
+        *self.token.write().unwrap() = token;
+    }
+
+    fn bearer(&self) -> String {
+        self.token.read().unwrap().clone()
+    }
+
+    /// Exchange an OAuth authorization code for an access token. The
+    /// returned token doubles as a normal API bearer token.
+    pub async fn exchange_code(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        code: &str,
+    ) -> Result<String> {
+        let resp: TokenResponse = self
+            .http
+            .post("https://todoist.com/oauth/access_token")
+            .form(&[
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("code", code),
+            ])
+            .send()
+            .await?
+            .error_for_status()
+            .context("exchanging oauth code")?
+            .json()
+            .await?;
+        Ok(resp.access_token)
     }
 
     /// All active tasks across all projects. Completed tasks are absent,
@@ -57,7 +102,7 @@ impl Client {
             let mut req = self
                 .http
                 .get(format!("{BASE}/tasks"))
-                .bearer_auth(&self.token)
+                .bearer_auth(self.bearer())
                 .query(&[("limit", "200")]);
             if let Some(c) = &cursor {
                 req = req.query(&[("cursor", c)]);
@@ -81,7 +126,7 @@ impl Client {
     pub async fn set_labels(&self, task_id: &str, labels: &[String]) -> Result<()> {
         self.http
             .post(format!("{BASE}/tasks/{task_id}"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer())
             .json(&serde_json::json!({ "labels": labels }))
             .send()
             .await?
@@ -93,7 +138,7 @@ impl Client {
     pub async fn set_description(&self, task_id: &str, description: &str) -> Result<()> {
         self.http
             .post(format!("{BASE}/tasks/{task_id}"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer())
             .json(&serde_json::json!({ "description": description }))
             .send()
             .await?

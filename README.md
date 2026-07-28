@@ -46,7 +46,13 @@ snippet in `/etc/caddy/conf.d/tache.caddy`. Runtime secrets live in
 `/home/zach/tache/.env` on the droplet, never in the repo or CI.
 
 The Todoist side needs a one-time app at https://developer.todoist.com/
-with webhook URL `https://tache.zach.network/todoist-hook`, events
-`item:added`, `item:updated`, `item:completed`, `item:uncompleted`,
-`item:deleted`; its client secret becomes `TODOIST_CLIENT_SECRET`
-(verifies the `X-Todoist-Hmac-SHA256` signature).
+with webhook URL `https://tache.zach.network/todoist-hook`, OAuth redirect
+URL `https://tache.zach.network/oauth/callback`, and events `item:added`,
+`item:updated`, `item:completed`, `item:uncompleted`, `item:deleted`. Its
+client id/secret go in the droplet `.env` (the secret also verifies the
+`X-Todoist-Hmac-SHA256` signature on webhooks).
+
+Todoist only activates webhooks for a user after an OAuth handshake, so
+tache hosts it: visit `/oauth/start`, approve, and the server exchanges
+the code, persists the token to `/data` (a volume, survives redeploys),
+swaps it in live, and runs a first sync. No manual token handling.

@@ -8,6 +8,8 @@ RUN cargo build --release
 FROM alpine:3
 COPY --from=build /src/target/release/tache /usr/local/bin/tache
 ENV TACHE_BIND=0.0.0.0:8321
+ENV TACHE_TOKEN_FILE=/data/token
+VOLUME /data
 EXPOSE 8321
 ENTRYPOINT ["tache"]
 CMD ["serve"]

@@ -52,13 +52,33 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Serve mode can start without a token (OAuth provides one); the CLI
+    // commands need one up front.
+    if let Command::Serve { bind } = &cli.command {
+        let token_file = std::path::PathBuf::from(
+            std::env::var("TACHE_TOKEN_FILE").unwrap_or_else(|_| "tache-token".into()),
+        );
+        // A token minted via /oauth/callback outlives whatever is in env.
+        let token = std::fs::read_to_string(&token_file)
+            .map(|t| t.trim().to_string())
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(|| std::env::var("TODOIST_API_TOKEN").ok())
+            .unwrap_or_default();
+        let client = std::sync::Arc::new(Client::new(token));
+        let oauth = server::Oauth {
+            client_id: std::env::var("TODOIST_CLIENT_ID").unwrap_or_default(),
+            client_secret: std::env::var("TODOIST_CLIENT_SECRET").unwrap_or_default(),
+            token_file,
+        };
+        return server::serve(bind, client, oauth).await;
+    }
+
     let client = Client::from_env()?;
 
     match cli.command {
-        Command::Serve { bind } => {
-            let secret = std::env::var("TODOIST_CLIENT_SECRET").unwrap_or_default();
-            server::serve(&bind, client, secret).await?;
-        }
+        Command::Serve { .. } => unreachable!("handled above"),
         Command::Sync => {
             let report = sync::reconcile(&client).await?;
             println!(

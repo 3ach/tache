@@ -8,6 +8,7 @@ set -euo pipefail
 NAME="tache"
 PORT=8321
 ENV_FILE="/home/zach/tache/.env"
+DATA_DIR="/home/zach/tache/data"
 CADDY_SNIPPET="/etc/caddy/conf.d/tache.caddy"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
@@ -20,11 +21,13 @@ docker pull "${IMAGE}"
 
 echo "==> replacing container ${NAME} (host port ${PORT})"
 docker rm -f "${NAME}" >/dev/null 2>&1 || true
+mkdir -p "${DATA_DIR}"
 docker run -d \
   --name "${NAME}" \
   --restart unless-stopped \
   -p "127.0.0.1:${PORT}:8321" \
   --env-file "${ENV_FILE}" \
+  -v "${DATA_DIR}:/data" \
   "${IMAGE}" >/dev/null
 
 echo "==> waiting for ${NAME} to become ready"

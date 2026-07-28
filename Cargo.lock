@@ -1218,6 +1218,7 @@ dependencies = [
  "base64",
  "clap",
  "dotenvy",
+ "getrandom 0.2.17",
  "hmac",
  "reqwest",
  "serde",
