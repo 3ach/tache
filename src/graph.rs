@@ -1,8 +1,11 @@
 //! Read-only HTML view of the dependency graph (GET /graph).
 //!
-//! Renders every `#dag` project's active tasks as its own Mermaid
-//! flowchart behind a vanilla-JS tab bar — one tab per project, nodes
-//! colored by frontier status, edges pointing prerequisite → dependent.
+//! Renders every `#dag` project's active tasks as its own left-to-right
+//! Mermaid flowchart behind a vanilla-JS tab bar — one tab per project,
+//! nodes colored by frontier status, edges pointing prerequisite →
+//! dependent. Maximal linear runs of blocked tasks collapse into a
+//! single "run" pill (first ⇢ last, count) so each chart reads as
+//! frontier tasks + branch/merge points + collapsed chains.
 //! Cross-project edges show the external endpoint as a dashed "ghost"
 //! node labeled with its name and project. Charts render lazily on first
 //! tab activation (Mermaid can't lay out inside display:none) and the
@@ -103,6 +106,13 @@ fn display_name(p: &Project) -> &str {
 /// Cross-project edges keep their prereq → dependent direction but the
 /// external endpoint becomes a dashed ghost node labeled with the task's
 /// name and project, so each tab stays self-contained.
+///
+/// Maximal linear runs of ≥2 all-blocked tasks — each with at most one
+/// incoming and one outgoing edge, counting ghost edges, and no ghost
+/// edge of its own — collapse into one subroutine-shaped `run` node
+/// labeled "first ⇢ last (n tasks)". Frontier tasks and branch/merge
+/// points always render individually; edges into a run's head and out of
+/// its tail reconnect to the collapsed node.
 fn project_chart(
     project: &Project,
     projects: &[Project],
@@ -120,13 +130,111 @@ fn project_chart(
         .map(|p| (p.id.as_str(), display_name(p)))
         .collect();
 
-    let mut out = String::from("flowchart TD\n");
+    let member_ids: HashSet<&str> = members.iter().map(|t| t.id.as_str()).collect();
+
+    // HashMap order is unstable; sort so output (and tests) are deterministic
+    let mut edges: Vec<(&str, &str)> = dag
+        .prereqs
+        .iter()
+        .flat_map(|(task, ps)| ps.iter().map(move |p| (p.as_str(), task.as_str())))
+        .collect();
+    edges.sort_unstable();
+
+    // Degrees over every drawable edge touching a member — internal edges
+    // plus ghost edges whose external endpoint resolves — so a task with an
+    // external dependency/dependent is never mistaken for a linear link.
+    let mut deg_in: HashMap<&str, usize> = HashMap::new();
+    let mut deg_out: HashMap<&str, usize> = HashMap::new();
+    let mut has_ghost: HashSet<&str> = HashSet::new();
+    let mut internal: Vec<(&str, &str)> = Vec::new();
+    for &(prereq, task) in &edges {
+        match (member_ids.contains(prereq), member_ids.contains(task)) {
+            (true, true) => {
+                internal.push((prereq, task));
+                *deg_out.entry(prereq).or_default() += 1;
+                *deg_in.entry(task).or_default() += 1;
+            }
+            (true, false) => {
+                if by_id.contains_key(task) {
+                    *deg_out.entry(prereq).or_default() += 1;
+                    has_ghost.insert(prereq);
+                }
+            }
+            (false, true) => {
+                if by_id.contains_key(prereq) {
+                    *deg_in.entry(task).or_default() += 1;
+                    has_ghost.insert(task);
+                }
+            }
+            (false, false) => {}
+        }
+    }
+
+    // A task may join a run only if it is blocked, purely linear (≤1 in,
+    // ≤1 out counting ghost edges), and free of ghost edges itself.
+    let is_next = |id: &str| matches!(classes.get(id).copied(), Some(LABEL_NEXT));
+    let collapsible = |id: &str| {
+        !is_next(id)
+            && !has_ghost.contains(id)
+            && deg_in.get(id).copied().unwrap_or(0) <= 1
+            && deg_out.get(id).copied().unwrap_or(0) <= 1
+    };
+
+    // Chain links: an internal edge between two collapsible tasks is, by
+    // the degree bound, the source's only out-edge and the target's only
+    // in-edge, so following links yields maximal linear runs.
+    let mut next_of: HashMap<&str, &str> = HashMap::new();
+    let mut prev_of: HashMap<&str, &str> = HashMap::new();
+    for &(a, b) in &internal {
+        if collapsible(a) && collapsible(b) {
+            next_of.insert(a, b);
+            prev_of.insert(b, a);
+        }
+    }
+    let mut in_run: HashMap<&str, &str> = HashMap::new(); // member id → run head id
+    let mut run_tail: HashMap<&str, (usize, &str)> = HashMap::new(); // head → (len, tail)
+    for t in &members {
+        let head = t.id.as_str();
+        if prev_of.contains_key(head) || !next_of.contains_key(head) {
+            continue; // not the head of a ≥2-task chain
+        }
+        let mut cur = head;
+        let mut len = 1;
+        in_run.insert(head, head);
+        while let Some(&nx) = next_of.get(cur) {
+            in_run.insert(nx, head);
+            cur = nx;
+            len += 1;
+        }
+        run_tail.insert(head, (len, cur));
+    }
+    let rid = |id: &str| match in_run.get(id) {
+        Some(head) => format!("C{head}"),
+        None => format!("T{id}"),
+    };
+
+    let mut out = String::from("flowchart LR\n");
     out.push_str("  classDef next fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20\n");
     out.push_str("  classDef blocked fill:#eceff1,stroke:#b0bec5,color:#78909c\n");
     out.push_str("  classDef ghost fill:#fafafa,stroke:#90a4ae,stroke-dasharray:5 4,color:#90a4ae\n");
+    out.push_str("  classDef run fill:#eceff1,stroke:#78909c,stroke-width:2px,color:#546e7a\n");
 
-    let member_ids: HashSet<&str> = members.iter().map(|t| t.id.as_str()).collect();
     for t in &members {
+        let id = t.id.as_str();
+        if let Some(&head) = in_run.get(id) {
+            if head != id {
+                continue; // rendered as part of its run's collapsed node
+            }
+            let (len, tail) = run_tail[head];
+            // [[…]] draws Mermaid's subroutine shape: double side bars,
+            // reading as "a stack of steps".
+            out.push_str(&format!(
+                "  C{id}[[\"{} ⇢ {} ({len} tasks)\"]]:::run\n",
+                escape(&t.content),
+                escape(&by_id[tail].content),
+            ));
+            continue;
+        }
         let class = match classes.get(&t.id).copied() {
             Some(LABEL_NEXT) => "next",
             _ => "blocked",
@@ -139,20 +247,17 @@ fn project_chart(
         ));
     }
 
-    // HashMap order is unstable; sort so output (and tests) are deterministic
-    let mut edges: Vec<(&str, &str)> = dag
-        .prereqs
-        .iter()
-        .flat_map(|(task, ps)| ps.iter().map(move |p| (p.as_str(), task.as_str())))
-        .collect();
-    edges.sort_unstable();
-
     let mut ghosts: HashSet<&str> = HashSet::new();
     for (prereq, task) in edges {
         let p_in = member_ids.contains(prereq);
         let t_in = member_ids.contains(task);
         match (p_in, t_in) {
-            (true, true) => out.push_str(&format!("  T{prereq} --> T{task}\n")),
+            (true, true) => {
+                let (a, b) = (rid(prereq), rid(task));
+                if a != b {
+                    out.push_str(&format!("  {a} --> {b}\n"));
+                }
+            }
             // External dependent: ghost it in the prerequisite's tab.
             (true, false) => {
                 let Some(label) = ghost_label(task, &by_id, &project_names) else {
@@ -237,7 +342,7 @@ mod tests {
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
         let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(chart.starts_with("flowchart TD"));
+        assert!(chart.starts_with("flowchart LR"));
         assert!(chart.contains("T1[\"buy lumber\"]:::next"));
         assert!(chart.contains("T2[\"sand &quot;rough&quot; boards\"]:::blocked"));
         assert!(chart.contains("T1 --> T2"));
@@ -312,9 +417,107 @@ mod tests {
         assert!(!html.contains("Empty"));
         assert!(html.contains("id=\"pane-p1\""));
         assert!(html.contains("id=\"pane-p2\""));
-        assert_eq!(html.matches("flowchart TD").count(), 2);
+        assert_eq!(html.matches("flowchart LR").count(), 2);
         assert!(html.contains("startOnLoad: false"));
         assert!(html.contains("mermaid.run"));
+    }
+
+    #[test]
+    fn blocked_linear_run_collapses_and_reconnects() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![
+            task("1", "assemble", "", "p1"),
+            task("2", "sand", "after: 1", "p1"),
+            task("3", "first coat", "after: 2", "p1"),
+            task("4", "buff", "after: 3", "p1"),
+            task("5", "install", "after: 4\nafter: 6", "p1"),
+            task("6", "buy hardware", "", "p1"),
+        ];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        // 2→3→4 are blocked and linear: one pill, first ⇢ last, count.
+        assert!(chart.contains("C2[[\"sand ⇢ buff (3 tasks)\"]]:::run"));
+        assert!(!chart.contains("T2["));
+        assert!(!chart.contains("T3["));
+        assert!(!chart.contains("T4["));
+        // Edges reconnect through the pill; intra-run edges vanish.
+        assert!(chart.contains("T1 --> C2"));
+        assert!(chart.contains("C2 --> T5"));
+        assert!(!chart.contains("C2 --> C2"));
+        // The merge point (two prereqs) stays individual.
+        assert!(chart.contains("T5[\"install\"]:::blocked"));
+        assert!(chart.contains("T6 --> T5"));
+        assert!(chart.contains("classDef run"));
+    }
+
+    #[test]
+    fn run_at_chain_end_collapses() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![
+            task("1", "assemble", "", "p1"),
+            task("2", "sand", "after: 1", "p1"),
+            task("3", "buff", "after: 2", "p1"),
+        ];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        assert!(chart.contains("T1[\"assemble\"]:::next"));
+        assert!(chart.contains("C2[[\"sand ⇢ buff (2 tasks)\"]]:::run"));
+        assert!(chart.contains("T1 --> C2"));
+        assert!(!chart.contains("T2["));
+        assert!(!chart.contains("T3["));
+    }
+
+    #[test]
+    fn chain_containing_next_task_does_not_collapse() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![
+            task("1", "assemble", "", "p1"),
+            task("2", "sand", "after: 1", "p1"),
+            task("3", "buff", "after: 2", "p1"),
+        ];
+        let dag = Dag::build(&tasks);
+        let mut classes = dag.classify(&tasks);
+        // Force a mid-chain frontier task: it must render individually and
+        // break the run; the lone blocked neighbor is too short to collapse.
+        classes.insert("2".into(), LABEL_NEXT);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        assert!(chart.contains("T2[\"sand\"]:::next"));
+        assert!(chart.contains("T3[\"buff\"]:::blocked"));
+        assert!(!chart.contains("[["));
+        assert!(chart.contains("T1 --> T2"));
+        assert!(chart.contains("T2 --> T3"));
+    }
+
+    #[test]
+    fn ghost_edge_tasks_are_never_absorbed_into_runs() {
+        let projects = vec![project("p1", "Shop"), project("p2", "House")];
+        let tasks = vec![
+            task("1", "assemble", "", "p1"),
+            task("2", "sand", "after: 1", "p1"),
+            task("3", "buff", "after: 2", "p1"),
+            task("9", "hang shelf", "after: 2", "p2"),
+            task("10", "style shelf", "after: 9", "p2"),
+        ];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+
+        // "sand" has an external dependent: it stays individual, so no run
+        // forms even though 2→3 would otherwise be a blocked chain.
+        let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        assert!(!shop.contains("[["));
+        assert!(shop.contains("T2[\"sand\"]:::blocked"));
+        assert!(shop.contains("T3[\"buff\"]:::blocked"));
+        assert!(shop.contains("T2 -.-> G9"));
+
+        // "hang shelf" has an external prerequisite: same rule on the
+        // dependent side, so the 9→10 chain stays uncollapsed too.
+        let house = project_chart(&projects[1], &projects, &tasks, &dag, &classes).unwrap();
+        assert!(!house.contains("[["));
+        assert!(house.contains("T9[\"hang shelf\"]:::blocked"));
+        assert!(house.contains("T10[\"style shelf\"]:::blocked"));
+        assert!(house.contains("G2 -.-> T9"));
     }
 
     #[test]
