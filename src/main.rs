@@ -1,14 +1,9 @@
-mod dag;
-mod graph;
-mod server;
-mod sync;
-mod todoist;
-
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use dag::Dag;
-use todoist::Client;
+use tache::dag::Dag;
+use tache::todoist::{self, Client};
+use tache::{server, sync};
 
 #[derive(Parser)]
 #[command(name = "tache", about = "Task DAG layer over Todoist")]

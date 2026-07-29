@@ -1,17 +1,31 @@
 //! Read-only HTML view of the dependency graph (GET /graph).
 //!
 //! Renders every `#dag` project's active tasks as its own left-to-right
-//! Mermaid flowchart behind a vanilla-JS tab bar — one tab per project,
+//! Graphviz digraph behind a vanilla-JS tab bar — one tab per project,
 //! nodes colored by frontier status, edges pointing prerequisite →
 //! dependent. Maximal linear runs of blocked tasks collapse into a
 //! single "run" pill (first ⇢ last, count) so each chart reads as
 //! frontier tasks + branch/merge points + collapsed chains.
 //! Cross-project edges show the external endpoint as a dashed "ghost"
-//! node labeled with its name and project. Charts render lazily on first
-//! tab activation (Mermaid can't lay out inside display:none) and the
-//! SVG is CSS-capped to fit the viewport. The server emits static HTML;
-//! Mermaid runs client-side from a CDN. Gated by TACHE_GRAPH_KEY since
-//! task contents are personal.
+//! node labeled with its name and project. Charts render lazily on
+//! first tab activation into a pan/zoom pane (wheel zooms at the
+//! cursor, drag pans; initial view is fit-to-width and top-aligned,
+//! double-click toggles between fit-width and fit-all). The server
+//! emits static HTML with DOT source per pane; layout runs client-side
+//! via @viz-js/viz (Graphviz compiled to WASM, one self-contained ESM
+//! from jsdelivr). Gated by TACHE_GRAPH_KEY since task contents are
+//! personal.
+//!
+//! Sizing: the DOT carries no size/ratio — those depend on the client's
+//! viewport, so the page computes the pane's aspect at render time and
+//! passes it as a `ratio` graph attribute through viz-js's
+//! graphAttributes option (Graphviz `-G` defaults, which apply because
+//! the DOT leaves them unset). Numeric ratio makes dot redistribute
+//! whitespace until drawing height/width matches the pane, so fit-width
+//! fills both dimensions without stretching text the way ratio=fill
+//! would. Graphviz's `unflatten` preprocessor (which staggers wide
+//! rank fans) would also help, but viz-js only ships layout engines
+//! (dot/neato/…), not unflatten, so it is not used.
 
 use std::collections::{HashMap, HashSet};
 
@@ -35,8 +49,10 @@ pub fn page(
             "<button class=\"tab\" data-tab=\"{id}\">{title}</button>",
             id = escape(&p.id),
         ));
+        // The <pre> holds raw DOT source until the pane's first
+        // activation swaps in the rendered SVG.
         panes.push_str(&format!(
-            "<div class=\"pane\" id=\"pane-{id}\"><pre class=\"mermaid\">\n{chart}</pre></div>\n",
+            "<div class=\"pane\" id=\"pane-{id}\"><pre class=\"chart\">\n{chart}</pre></div>\n",
             id = escape(&p.id),
         ));
     }
@@ -49,42 +65,136 @@ pub fn page(
 <meta name="robots" content="noindex">
 <title>tache graph</title>
 <style>
-  body {{ margin: 0; padding: 0.75rem 1rem; background: #fafafa; font-family: system-ui, sans-serif; }}
+  html, body {{ height: 100%; }}
+  body {{ margin: 0; padding: 0.75rem 1rem; box-sizing: border-box; display: flex;
+         flex-direction: column; background: #fafafa; font-family: system-ui, sans-serif; }}
   h1 {{ font-size: 1.1rem; font-weight: 600; margin: 0 0 0.6rem; }}
   #tabs {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.6rem; }}
   .tab {{ font: inherit; padding: 0.3rem 0.9rem; border: 1px solid #cfd8dc; border-radius: 999px;
          background: #fff; color: #455a64; cursor: pointer; }}
   .tab.active {{ background: #2e7d32; border-color: #2e7d32; color: #fff; }}
-  .pane {{ display: none; }}
+  /* Each pane is a pan/zoom viewport filling the space below the tab bar:
+     the chart renders at natural size and a translate+scale transform
+     (per-tab view state) positions it. */
+  #panes {{ flex: 1; min-height: 0; position: relative; }}
+  .pane {{ display: none; position: absolute; inset: 0; overflow: hidden; cursor: grab;
+          border: 1px solid #eceff1; border-radius: 6px; background: #fff; touch-action: none; }}
   .pane.active {{ display: block; }}
-  .pane pre.mermaid {{ margin: 0; text-align: center; }}
-  /* Hide raw Mermaid source until it has been rendered into an SVG. */
-  pre.mermaid:not([data-processed]) {{ visibility: hidden; }}
-  /* Fit-to-screen: scale down to the viewport (minus header + tab bar),
-     preserving aspect ratio; never scale up past natural size. */
-  .pane svg {{ display: block; margin: 0 auto; width: auto; height: auto;
-              max-width: 100%; max-height: calc(100vh - 6.5rem); }}
+  .pane pre.chart {{ margin: 0; position: absolute; left: 0; top: 0;
+                    transform-origin: 0 0; line-height: 0; }}
+  .pane svg {{ display: block; }}
+  /* Pin SVG text to the family graphviz measured with (Helvetica; Arial
+     and Liberation Sans are metric-compatible) so the page's system-ui
+     font-family can't substitute wider glyphs that overflow node boxes. */
+  .pane svg text {{ font-family: Helvetica, Arial, "Liberation Sans", sans-serif; }}
+  /* Hide raw DOT source until it has been rendered into an SVG. */
+  pre.chart:not([data-processed]) {{ visibility: hidden; }}
 </style>
 </head>
 <body>
 <h1>tache — dependency graph</h1>
 <nav id="tabs">{tabs}</nav>
-{panes}<script type="module">
-import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
-// useMaxWidth:false keeps mermaid from pinning inline width styles so the
-// CSS max-width/max-height rules above control the final size.
-mermaid.initialize({{ startOnLoad: false, theme: "neutral", flowchart: {{ useMaxWidth: false }} }});
+<main id="panes">
+{panes}</main>
+<script type="module">
+import {{ instance }} from "https://cdn.jsdelivr.net/npm/@viz-js/viz@3.28.0/dist/viz.js";
+// Real Graphviz (dot engine) compiled to WASM; one self-contained
+// module, renders synchronously once loaded. Kick off the load now so
+// the first tab doesn't wait on it serially.
+const vizReady = instance();
+
+// Pan/zoom: per-tab {{x, y, k}} applied as a CSS transform on the chart.
+const views = new Map();
+function apply(pane) {{
+  const v = views.get(pane.id);
+  const pre = pane.querySelector("pre.chart");
+  if (v && pre) pre.style.transform = `translate(${{v.x}}px, ${{v.y}}px) scale(${{v.k}})`;
+}}
+// Two fit modes: "width" (the default view) scales the chart to fill
+// the pane's width and top-aligns it — tall charts are panned/scrolled
+// through, not shrunk into frame. Capped at 1.5x so small charts don't
+// blow up cartoonishly; charts wider than the pane scale down below
+// natural size. "all" is the classic fit-everything overview.
+// Double-click toggles between the two.
+const modes = new Map();
+function fit(pane, mode = "width") {{
+  const svg = pane.querySelector("svg");
+  if (!svg) return;
+  const vb = svg.viewBox.baseVal;
+  const w = vb && vb.width ? vb.width : svg.getBoundingClientRect().width;
+  const h = vb && vb.height ? vb.height : svg.getBoundingClientRect().height;
+  if (!w || !h) return;
+  let k, y;
+  const pad = 12;
+  if (mode === "all") {{
+    k = Math.min(pane.clientWidth / w, pane.clientHeight / h, 1);
+    y = (pane.clientHeight - h * k) / 2;
+  }} else {{
+    k = Math.min((pane.clientWidth - 2 * pad) / w, 1.5);
+    y = pad;
+  }}
+  views.set(pane.id, {{ k, x: (pane.clientWidth - w * k) / 2, y }});
+  modes.set(pane.id, mode);
+  apply(pane);
+}}
+for (const pane of document.querySelectorAll(".pane")) {{
+  pane.addEventListener("wheel", (e) => {{
+    const v = views.get(pane.id);
+    if (!v) return;
+    e.preventDefault();
+    const k = Math.min(Math.max(v.k * Math.exp(-e.deltaY * 0.0015), 0.05), 8);
+    const r = pane.getBoundingClientRect();
+    const cx = e.clientX - r.left, cy = e.clientY - r.top;
+    // Keep the point under the cursor fixed while scaling around it.
+    v.x = cx - ((cx - v.x) * k) / v.k;
+    v.y = cy - ((cy - v.y) * k) / v.k;
+    v.k = k;
+    apply(pane);
+  }}, {{ passive: false }});
+  pane.addEventListener("pointerdown", (e) => {{
+    const v = views.get(pane.id);
+    if (!v || e.button !== 0) return;
+    e.preventDefault();
+    pane.setPointerCapture(e.pointerId);
+    const sx = e.clientX - v.x, sy = e.clientY - v.y;
+    const move = (m) => {{ v.x = m.clientX - sx; v.y = m.clientY - sy; apply(pane); }};
+    pane.addEventListener("pointermove", move);
+    pane.addEventListener("pointerup",
+      () => pane.removeEventListener("pointermove", move), {{ once: true }});
+  }});
+  pane.addEventListener("dblclick", () =>
+    fit(pane, modes.get(pane.id) === "width" ? "all" : "width"));
+}}
+
 const rendered = new Set();
 async function activate(id) {{
   for (const b of document.querySelectorAll(".tab"))
     b.classList.toggle("active", b.dataset.tab === id);
   for (const p of document.querySelectorAll(".pane"))
     p.classList.toggle("active", p.id === "pane-" + id);
-  if (!rendered.has(id)) {{
-    rendered.add(id);
-    const el = document.querySelector('[id="pane-' + id + '"] .mermaid');
-    if (el) await mermaid.run({{ nodes: [el] }});
-  }}
+  if (rendered.has(id)) return;
+  rendered.add(id);
+  const pane = document.getElementById("pane-" + id);
+  const el = pane && pane.querySelector(".chart");
+  if (!el) return;
+  const viz = await vizReady;
+  // Layout hint: the DOT sets no ratio, so this -G default applies.
+  // Numeric ratio = desired drawing height/width; dot spreads node
+  // positions in whichever dimension falls short, so the drawing's
+  // aspect matches the pane and fit-width fills it top to bottom.
+  const pad = 12;
+  const ratio = Math.max(
+    (pane.clientHeight - 2 * pad) / Math.max(pane.clientWidth - 2 * pad, 1), 0.05);
+  const svg = viz.renderSVGElement(el.textContent,
+    {{ graphAttributes: {{ ratio: ratio.toFixed(3) }} }});
+  // viz sizes the SVG in pt (1pt = 4/3 px); pin the on-screen size to
+  // the viewBox's unit count so fit()'s math is exact at scale 1.
+  const vb = svg.viewBox.baseVal;
+  svg.style.width = vb.width + "px";
+  svg.style.height = vb.height + "px";
+  el.replaceChildren(svg);
+  el.setAttribute("data-processed", "");
+  fit(pane);
 }}
 for (const b of document.querySelectorAll(".tab"))
   b.addEventListener("click", () => activate(b.dataset.tab));
@@ -101,7 +211,7 @@ fn display_name(p: &Project) -> &str {
     if p.name.is_empty() { &p.id } else { &p.name }
 }
 
-/// Mermaid flowchart for one project, or None if it has no tasks.
+/// Graphviz DOT digraph for one project, or None if it has no tasks.
 ///
 /// Cross-project edges keep their prereq → dependent direction but the
 /// external endpoint becomes a dashed ghost node labeled with the task's
@@ -109,7 +219,7 @@ fn display_name(p: &Project) -> &str {
 ///
 /// Maximal linear runs of ≥2 all-blocked tasks — each with at most one
 /// incoming and one outgoing edge, counting ghost edges, and no ghost
-/// edge of its own — collapse into one subroutine-shaped `run` node
+/// edge of its own — collapse into one sharp-cornered `run` node
 /// labeled "first ⇢ last (n tasks)". Frontier tasks and branch/merge
 /// points always render individually; edges into a run's head and out of
 /// its tail reconnect to the collapsed node.
@@ -213,11 +323,41 @@ fn project_chart(
         None => format!("T{id}"),
     };
 
-    let mut out = String::from("flowchart LR\n");
-    out.push_str("  classDef next fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20\n");
-    out.push_str("  classDef blocked fill:#eceff1,stroke:#b0bec5,color:#78909c\n");
-    out.push_str("  classDef ghost fill:#fafafa,stroke:#90a4ae,stroke-dasharray:5 4,color:#90a4ae\n");
-    out.push_str("  classDef run fill:#eceff1,stroke:#78909c,stroke-width:2px,color:#546e7a\n");
+    // Per-status node attributes, the DOT equivalent of the old Mermaid
+    // classDefs. `class=` carries through to the SVG for debugging and
+    // tests; the inline attrs do the actual styling.
+    const NEXT: &str = r##"class="next", fillcolor="#c8e6c9", color="#2e7d32", fontcolor="#1b5e20""##;
+    const BLOCKED: &str =
+        r##"class="blocked", fillcolor="#eceff1", color="#b0bec5", fontcolor="#78909c""##;
+    const GHOST: &str = r##"class="ghost", style="filled,rounded,dashed", fillcolor="#fafafa", color="#90a4ae", fontcolor="#90a4ae""##;
+    // Flat but sharp-cornered — style=filled drops the default node
+    // style's "rounded" — so collapsed runs read differently from
+    // single-task pills; blocked palette with a darker border.
+    const RUN: &str = r##"class="run", style=filled, fillcolor="#eceff1", color="#78909c", fontcolor="#546e7a""##;
+
+    // Sizing lives client-side (see module docs): the page passes the
+    // pane's aspect as a `ratio` -G default at render time, so the DOT
+    // deliberately sets no size/ratio. The rest is tuned for the typical
+    // shape — many parallel chains merging into hubs — which in LR is
+    // row-count-bound: fit scale ≈ paneHeight / (rows × rowHeight), so
+    // squat nodes (height=0.3 instead of graphviz's 0.5in minimum) and a
+    // tight nodesep buy the labels ~40% more on-screen size. ranksep
+    // barely matters: numeric ratio rescales rank spacing anyway.
+    let mut out = String::from("digraph {\n");
+    out.push_str("  rankdir=LR\n");
+    out.push_str("  bgcolor=\"transparent\"\n");
+    out.push_str("  nodesep=0.15\n");
+    out.push_str("  ranksep=0.6\n");
+    // fontname is plain "Helvetica" — a name graphviz's built-in metric
+    // tables know — so node sizing uses the same metrics the browser
+    // renders with (the page CSS pins svg text to Helvetica/Arial).
+    // Font-list values like "Helvetica,Arial,sans-serif" miss the tables
+    // and fall back to narrower estimates, overflowing the boxes.
+    out.push_str("  fontname=\"Helvetica\"\n");
+    out.push_str(
+        "  node [shape=box, style=\"filled,rounded\", fontname=\"Helvetica\", fontsize=13, height=0.3, margin=\"0.15,0.08\"]\n",
+    );
+    out.push_str("  edge [color=\"#90a4ae\", arrowsize=0.8, fontname=\"Helvetica\"]\n");
 
     for t in &members {
         let id = t.id.as_str();
@@ -226,25 +366,15 @@ fn project_chart(
                 continue; // rendered as part of its run's collapsed node
             }
             let (len, tail) = run_tail[head];
-            // [[…]] draws Mermaid's subroutine shape: double side bars,
-            // reading as "a stack of steps".
-            out.push_str(&format!(
-                "  C{id}[[\"{} ⇢ {} ({len} tasks)\"]]:::run\n",
-                escape(&t.content),
-                escape(&by_id[tail].content),
-            ));
+            let text = format!("{} ⇢ {} ({len} tasks)", t.content, by_id[tail].content);
+            out.push_str(&format!("  C{id} [label=\"{}\", {RUN}]\n", label(&text)));
             continue;
         }
-        let class = match classes.get(&t.id).copied() {
-            Some(LABEL_NEXT) => "next",
-            _ => "blocked",
+        let attrs = match classes.get(&t.id).copied() {
+            Some(LABEL_NEXT) => NEXT,
+            _ => BLOCKED,
         };
-        out.push_str(&format!(
-            "  T{}[\"{}\"]:::{}\n",
-            t.id,
-            escape(&t.content),
-            class
-        ));
+        out.push_str(&format!("  T{id} [label=\"{}\", {attrs}]\n", label(&t.content)));
     }
 
     let mut ghosts: HashSet<&str> = HashSet::new();
@@ -255,7 +385,7 @@ fn project_chart(
             (true, true) => {
                 let (a, b) = (rid(prereq), rid(task));
                 if a != b {
-                    out.push_str(&format!("  {a} --> {b}\n"));
+                    out.push_str(&format!("  {a} -> {b}\n"));
                 }
             }
             // External dependent: ghost it in the prerequisite's tab.
@@ -264,9 +394,9 @@ fn project_chart(
                     continue;
                 };
                 if ghosts.insert(task) {
-                    out.push_str(&format!("  G{task}[\"{label}\"]:::ghost\n"));
+                    out.push_str(&format!("  G{task} [label=\"{label}\", {GHOST}]\n"));
                 }
-                out.push_str(&format!("  T{prereq} -.-> G{task}\n"));
+                out.push_str(&format!("  T{prereq} -> G{task} [style=dashed]\n"));
             }
             // External prerequisite: ghost it in the dependent's tab.
             (false, true) => {
@@ -274,13 +404,14 @@ fn project_chart(
                     continue;
                 };
                 if ghosts.insert(prereq) {
-                    out.push_str(&format!("  G{prereq}[\"{label}\"]:::ghost\n"));
+                    out.push_str(&format!("  G{prereq} [label=\"{label}\", {GHOST}]\n"));
                 }
-                out.push_str(&format!("  G{prereq} -.-> T{task}\n"));
+                out.push_str(&format!("  G{prereq} -> T{task} [style=dashed]\n"));
             }
             (false, false) => {}
         }
     }
+    out.push_str("}\n");
     Some(out)
 }
 
@@ -296,12 +427,63 @@ fn ghost_label(
         .get(t.project_id.as_str())
         .copied()
         .unwrap_or(t.project_id.as_str());
-    Some(format!("{} ({})", escape(&t.content), escape(project)))
+    Some(label(&format!("{} ({project})", t.content)))
 }
 
-/// Escape for a Mermaid quoted node label inside a `<pre>` block: the
-/// browser decodes HTML entities before Mermaid parses, so entities cover
-/// both layers.
+/// Wrap threshold: graphviz never wraps labels itself, so lines longer
+/// than this many chars break at word boundaries server-side.
+const WRAP_COLS: usize = 30;
+
+/// Wrap + escape for a DOT double-quoted label inside a `<pre>` block.
+///
+/// Wrapping happens first, on the raw text, so line widths count real
+/// characters rather than entity expansions. Each line is then escaped
+/// in two layers: backslash-escaping makes it safe for DOT (which the
+/// client reads via textContent, i.e. after HTML entity decoding), and
+/// entity-escaping &/</> keeps the surrounding HTML intact. Backslash
+/// first so we don't re-escape our own escapes; & before </> so we
+/// don't re-escape the entities'. Lines join with a literal `\n` added
+/// after escaping, so it reaches graphviz as the DOT newline escape.
+fn label(s: &str) -> String {
+    wrap(s, WRAP_COLS)
+        .iter()
+        .map(|line| {
+            line.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        })
+        .collect::<Vec<_>>()
+        .join("\\n")
+}
+
+/// Greedy word wrap at `cols` characters. Words longer than a whole
+/// line stand alone unbroken; runs of whitespace collapse to one space.
+fn wrap(s: &str, cols: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut width = 0;
+    for word in s.split_whitespace() {
+        let wlen = word.chars().count();
+        if width > 0 && width + 1 + wlen > cols {
+            lines.push(std::mem::take(&mut line));
+            width = 0;
+        }
+        if width > 0 {
+            line.push(' ');
+            width += 1;
+        }
+        line.push_str(word);
+        width += wlen;
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Escape for HTML text and attribute values (tab titles, pane ids).
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -342,11 +524,86 @@ mod tests {
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
         let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(chart.starts_with("flowchart LR"));
-        assert!(chart.contains("T1[\"buy lumber\"]:::next"));
-        assert!(chart.contains("T2[\"sand &quot;rough&quot; boards\"]:::blocked"));
-        assert!(chart.contains("T1 --> T2"));
-        assert!(!chart.contains("subgraph"));
+        assert!(chart.starts_with("digraph {"));
+        assert!(chart.trim_end().ends_with('}'));
+        assert!(chart.contains("rankdir=LR"));
+        assert!(chart.contains("T1 [label=\"buy lumber\", class=\"next\""));
+        assert!(chart.contains("T2 [label=\"sand \\\"rough\\\" boards\", class=\"blocked\""));
+        assert!(chart.contains("T1 -> T2"));
+        // Sizing is a client-side -G default; the DOT must not pin it.
+        assert!(!chart.contains("ratio"));
+        assert!(!chart.contains(" size="));
+    }
+
+    #[test]
+    fn labels_escape_dot_and_html() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![task("1", "glue A\\B <&> \"joints\"", "", "p1")];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        // Backslash and quote are DOT-escaped; &, <, > are HTML entities
+        // (the browser decodes them back before viz parses the DOT).
+        assert!(chart.contains(r#"label="glue A\\B &lt;&amp;&gt; \"joints\"""#));
+    }
+
+    #[test]
+    fn long_labels_wrap_at_word_boundaries() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![task(
+            "1",
+            "Apply second finish coat to the corner-lower cabinet carcass",
+            "",
+            "p1",
+        )];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        // Greedy 30-col wrap; the literal \n survives to graphviz.
+        assert!(chart.contains(
+            r#"label="Apply second finish coat to\nthe corner-lower cabinet\ncarcass""#
+        ));
+    }
+
+    #[test]
+    fn short_labels_stay_on_one_line() {
+        assert_eq!(label("sand the panel"), "sand the panel");
+        assert_eq!(wrap("sand the panel", 30), vec!["sand the panel"]);
+        // Exactly at the limit: still one line.
+        assert_eq!(wrap(&"x".repeat(30), 30), vec!["x".repeat(30)]);
+        // A single overlong word is never broken mid-word.
+        assert_eq!(wrap(&"y".repeat(40), 30), vec!["y".repeat(40)]);
+    }
+
+    #[test]
+    fn wrapping_counts_raw_chars_not_escaped_entities() {
+        // Widths are measured before escaping, so quotes count as one
+        // char and &/< don't balloon into entity-length "words"; the
+        // join's \n lands outside any escape sequence.
+        let name = r#"sand the "extra-long" panels & <braces> before glue-up"#;
+        assert_eq!(
+            label(name),
+            "sand the \\\"extra-long\\\" panels &amp;\\n&lt;braces&gt; before glue-up"
+        );
+    }
+
+    #[test]
+    fn collapsed_run_pill_labels_wrap() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![
+            task("1", "cut parts", "", "p1"),
+            task("2", "apply first finish coat to carcass", "after: 1", "p1"),
+            task("3", "buff the finished carcass smooth", "after: 2", "p1"),
+            task("4", "install", "after: 3\nafter: 5", "p1"),
+            task("5", "buy hardware", "", "p1"),
+        ];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        // The pill label wraps as one composed string, not per part.
+        assert!(chart.contains(
+            r#"C2 [label="apply first finish coat to\ncarcass ⇢ buff the finished\ncarcass smooth (2 tasks)", class="run""#
+        ));
     }
 
     #[test]
@@ -369,17 +626,17 @@ mod tests {
 
         // Prereq's tab: dependent appears as a ghost.
         let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(shop.contains("T1[\"build cabinet\"]:::next"));
-        assert!(shop.contains("G2[\"install cabinet (House)\"]:::ghost"));
-        assert!(shop.contains("T1 -.-> G2"));
-        assert!(!shop.contains("T2[\"install cabinet\"]"));
+        assert!(shop.contains("T1 [label=\"build cabinet\", class=\"next\""));
+        assert!(shop.contains("G2 [label=\"install cabinet (House)\", class=\"ghost\""));
+        assert!(shop.contains("T1 -> G2 [style=dashed]"));
+        assert!(!shop.contains("T2 [label=\"install cabinet\""));
 
         // Dependent's tab: prerequisite appears as a ghost.
         let house = project_chart(&projects[1], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(house.contains("T2[\"install cabinet\"]:::blocked"));
-        assert!(house.contains("G1[\"build cabinet (Shop)\"]:::ghost"));
-        assert!(house.contains("G1 -.-> T2"));
-        assert!(!house.contains("T1[\"build cabinet\"]"));
+        assert!(house.contains("T2 [label=\"install cabinet\", class=\"blocked\""));
+        assert!(house.contains("G1 [label=\"build cabinet (Shop)\", class=\"ghost\""));
+        assert!(house.contains("G1 -> T2 [style=dashed]"));
+        assert!(!house.contains("T1 [label=\"build cabinet\""));
     }
 
     #[test]
@@ -393,9 +650,9 @@ mod tests {
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
         let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
-        assert_eq!(shop.matches("G3[").count(), 1);
-        assert!(shop.contains("T1 -.-> G3"));
-        assert!(shop.contains("T2 -.-> G3"));
+        assert_eq!(shop.matches("G3 [label=").count(), 1);
+        assert!(shop.contains("T1 -> G3 [style=dashed]"));
+        assert!(shop.contains("T2 -> G3 [style=dashed]"));
     }
 
     #[test]
@@ -417,9 +674,10 @@ mod tests {
         assert!(!html.contains("Empty"));
         assert!(html.contains("id=\"pane-p1\""));
         assert!(html.contains("id=\"pane-p2\""));
-        assert_eq!(html.matches("flowchart LR").count(), 2);
-        assert!(html.contains("startOnLoad: false"));
-        assert!(html.contains("mermaid.run"));
+        assert_eq!(html.matches("digraph {").count(), 2);
+        assert!(html.contains("@viz-js/viz"));
+        assert!(html.contains("renderSVGElement"));
+        assert!(!html.contains("mermaid"));
     }
 
     #[test]
@@ -437,18 +695,21 @@ mod tests {
         let classes = dag.classify(&tasks);
         let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
         // 2→3→4 are blocked and linear: one pill, first ⇢ last, count.
-        assert!(chart.contains("C2[[\"sand ⇢ buff (3 tasks)\"]]:::run"));
-        assert!(!chart.contains("T2["));
-        assert!(!chart.contains("T3["));
-        assert!(!chart.contains("T4["));
+        assert!(chart.contains("C2 [label=\"sand ⇢ buff (3 tasks)\", class=\"run\""));
+        // Runs are flat boxes with sharp corners: same default shape, but
+        // style=filled drops the "rounded" that other nodes carry.
+        assert!(!chart.contains("shape=box3d"));
+        assert!(chart.contains("class=\"run\", style=filled"));
+        assert!(!chart.contains("T2 ["));
+        assert!(!chart.contains("T3 ["));
+        assert!(!chart.contains("T4 ["));
         // Edges reconnect through the pill; intra-run edges vanish.
-        assert!(chart.contains("T1 --> C2"));
-        assert!(chart.contains("C2 --> T5"));
-        assert!(!chart.contains("C2 --> C2"));
+        assert!(chart.contains("T1 -> C2"));
+        assert!(chart.contains("C2 -> T5"));
+        assert!(!chart.contains("C2 -> C2"));
         // The merge point (two prereqs) stays individual.
-        assert!(chart.contains("T5[\"install\"]:::blocked"));
-        assert!(chart.contains("T6 --> T5"));
-        assert!(chart.contains("classDef run"));
+        assert!(chart.contains("T5 [label=\"install\", class=\"blocked\""));
+        assert!(chart.contains("T6 -> T5"));
     }
 
     #[test]
@@ -462,11 +723,11 @@ mod tests {
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
         let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(chart.contains("T1[\"assemble\"]:::next"));
-        assert!(chart.contains("C2[[\"sand ⇢ buff (2 tasks)\"]]:::run"));
-        assert!(chart.contains("T1 --> C2"));
-        assert!(!chart.contains("T2["));
-        assert!(!chart.contains("T3["));
+        assert!(chart.contains("T1 [label=\"assemble\", class=\"next\""));
+        assert!(chart.contains("C2 [label=\"sand ⇢ buff (2 tasks)\", class=\"run\""));
+        assert!(chart.contains("T1 -> C2"));
+        assert!(!chart.contains("T2 ["));
+        assert!(!chart.contains("T3 ["));
     }
 
     #[test]
@@ -483,11 +744,11 @@ mod tests {
         // break the run; the lone blocked neighbor is too short to collapse.
         classes.insert("2".into(), LABEL_NEXT);
         let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(chart.contains("T2[\"sand\"]:::next"));
-        assert!(chart.contains("T3[\"buff\"]:::blocked"));
-        assert!(!chart.contains("[["));
-        assert!(chart.contains("T1 --> T2"));
-        assert!(chart.contains("T2 --> T3"));
+        assert!(chart.contains("T2 [label=\"sand\", class=\"next\""));
+        assert!(chart.contains("T3 [label=\"buff\", class=\"blocked\""));
+        assert!(!chart.contains("class=\"run\""));
+        assert!(chart.contains("T1 -> T2"));
+        assert!(chart.contains("T2 -> T3"));
     }
 
     #[test]
@@ -506,18 +767,39 @@ mod tests {
         // "sand" has an external dependent: it stays individual, so no run
         // forms even though 2→3 would otherwise be a blocked chain.
         let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(!shop.contains("[["));
-        assert!(shop.contains("T2[\"sand\"]:::blocked"));
-        assert!(shop.contains("T3[\"buff\"]:::blocked"));
-        assert!(shop.contains("T2 -.-> G9"));
+        assert!(!shop.contains("class=\"run\""));
+        assert!(shop.contains("T2 [label=\"sand\", class=\"blocked\""));
+        assert!(shop.contains("T3 [label=\"buff\", class=\"blocked\""));
+        assert!(shop.contains("T2 -> G9 [style=dashed]"));
 
         // "hang shelf" has an external prerequisite: same rule on the
         // dependent side, so the 9→10 chain stays uncollapsed too.
         let house = project_chart(&projects[1], &projects, &tasks, &dag, &classes).unwrap();
-        assert!(!house.contains("[["));
-        assert!(house.contains("T9[\"hang shelf\"]:::blocked"));
-        assert!(house.contains("T10[\"style shelf\"]:::blocked"));
-        assert!(house.contains("G2 -.-> T9"));
+        assert!(!house.contains("class=\"run\""));
+        assert!(house.contains("T9 [label=\"hang shelf\", class=\"blocked\""));
+        assert!(house.contains("T10 [label=\"style shelf\", class=\"blocked\""));
+        assert!(house.contains("G2 -> T9 [style=dashed]"));
+    }
+
+    #[test]
+    fn many_incoming_edges_all_draw() {
+        let projects = vec![project("p1", "Shop")];
+        let n = 20;
+        let mut tasks: Vec<Task> = (1..=n)
+            .map(|i| task(&i.to_string(), &format!("part {i}"), "", "p1"))
+            .collect();
+        let after: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+        tasks.push(task(
+            "99",
+            "install",
+            &format!("after: {}", after.join(", ")),
+            "p1",
+        ));
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        assert!(chart.contains("T99 [label=\"install\", class=\"blocked\""));
+        assert_eq!(chart.matches("-> T99").count(), n);
     }
 
     #[test]
