@@ -24,8 +24,9 @@ official app:
 (overdue | today) | @next
 ```
 
-There is no polling. Todoist webhooks trigger reconciles; `tache sync` is
-the manual fallback if a delivery is ever dropped.
+Todoist webhooks trigger reconciles; a periodic pass (`TACHE_SYNC_MINUTES`,
+default 15, 0 disables) catches dropped deliveries. `tache sync` reconciles
+on demand.
 
 ## CLI
 

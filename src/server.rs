@@ -3,8 +3,9 @@
 //! Todoist delivers events to POST /todoist-hook, authenticated with an
 //! HMAC-SHA256 signature over the raw body (X-Todoist-Hmac-SHA256,
 //! base64, keyed by the app's client secret). Events are coalesced for a
-//! short window, then one reconcile pass runs. There is no polling: if
-//! Todoist drops a delivery, `tache sync` reconciles by hand.
+//! short window, then one reconcile pass runs. A periodic timer
+//! (TACHE_SYNC_MINUTES, default 15, 0 disables) kicks the same loop as a
+//! safety net for dropped deliveries; `tache sync` reconciles by hand.
 //!
 //! Todoist only activates webhooks for a user after they complete the
 //! OAuth flow for the app, so the server also hosts it: GET /oauth/start
@@ -57,6 +58,7 @@ pub async fn serve(
     client: Arc<Client>,
     oauth: Oauth,
     graph_key: Option<String>,
+    sync_minutes: u64,
 ) -> Result<()> {
     if oauth.client_secret.is_empty() {
         tracing::warn!(
@@ -90,6 +92,23 @@ pub async fn serve(
             }
         }
     });
+
+    // Safety net for dropped webhook deliveries: kick the reconcile loop
+    // on an interval.
+    if sync_minutes == 0 {
+        tracing::info!("TACHE_SYNC_MINUTES=0 — periodic reconcile disabled");
+    } else {
+        let timer_kick = kick.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(sync_minutes * 60));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                let _ = timer_kick.try_send(());
+            }
+        });
+        tracing::info!("periodic reconcile every {sync_minutes}m");
+    }
 
     if graph_key.is_none() {
         tracing::info!("TACHE_GRAPH_KEY is not set — /graph is disabled");
