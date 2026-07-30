@@ -93,9 +93,8 @@ fn main() {
     // Downstream of the hub.
     tasks.push(task("books", "load books", "after: hub", "lib"));
 
-    // A chain of realistically long task names: a frontier head, then a
-    // blocked linear run whose collapsed pill label ("first ⇢ last (N
-    // tasks)") gets very long — exercises server-side label wrapping.
+    // A chain of realistically long task names — exercises server-side
+    // label wrapping on both frontier and blocked nodes.
     tasks.push(task(
         "long0",
         "Template the corner-lower cabinet scribe against the wall irregularities",
