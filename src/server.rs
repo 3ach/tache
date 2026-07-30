@@ -11,6 +11,8 @@
 //! OAuth flow for the app, so the server also hosts it: GET /oauth/start
 //! redirects to the consent page, and /oauth/callback (the app's redirect
 //! URL) exchanges the code, persists the token, and swaps it in live.
+//!
+//! GET / serves the public read-only graph view (see `graph`).
 
 use anyhow::{Context, Result};
 use axum::{
@@ -46,8 +48,6 @@ pub struct Oauth {
 struct AppState {
     client: Arc<Client>,
     oauth: Oauth,
-    /// Shared secret for the read-only /graph view; None disables it.
-    graph_key: Option<String>,
     /// CSRF state for the in-flight OAuth attempt, if any.
     pending_state: Mutex<Option<String>>,
     kick: mpsc::Sender<()>,
@@ -57,7 +57,6 @@ pub async fn serve(
     bind: &str,
     client: Arc<Client>,
     oauth: Oauth,
-    graph_key: Option<String>,
     sync_minutes: u64,
 ) -> Result<()> {
     if oauth.client_secret.is_empty() {
@@ -110,20 +109,15 @@ pub async fn serve(
         tracing::info!("periodic reconcile every {sync_minutes}m");
     }
 
-    if graph_key.is_none() {
-        tracing::info!("TACHE_GRAPH_KEY is not set — /graph is disabled");
-    }
-
     let state = Arc::new(AppState {
         client,
         oauth,
-        graph_key,
         pending_state: Mutex::new(None),
         kick,
     });
     let app = Router::new()
+        .route("/", get(graph_view))
         .route("/health", get(|| async { "ok" }))
-        .route("/graph", get(graph_view))
         .route("/todoist-hook", post(hook))
         .route("/oauth/start", get(oauth_start))
         .route("/oauth/callback", get(oauth_callback))
@@ -150,20 +144,9 @@ async fn hook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Byte
     StatusCode::OK
 }
 
-async fn graph_view(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> axum::response::Response {
-    let Some(key) = &state.graph_key else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "TACHE_GRAPH_KEY is not set — graph view disabled",
-        )
-            .into_response();
-    };
-    if params.get("key") != Some(key) {
-        return (StatusCode::FORBIDDEN, "missing or bad ?key=").into_response();
-    }
+/// Public read-only graph page at the root. No auth: the rendered task
+/// names are deliberately shareable.
+async fn graph_view(State(state): State<Arc<AppState>>) -> axum::response::Response {
     match render_graph(&state.client).await {
         Ok(html) => axum::response::Html(html).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("todoist fetch failed: {e}")).into_response(),

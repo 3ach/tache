@@ -58,12 +58,11 @@ async fn main() -> Result<()> {
             client_secret: std::env::var("TODOIST_CLIENT_SECRET").unwrap_or_default(),
             token_file: token_file(),
         };
-        let graph_key = std::env::var("TACHE_GRAPH_KEY").ok().filter(|k| !k.is_empty());
         let sync_minutes = std::env::var("TACHE_SYNC_MINUTES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(15);
-        return server::serve(bind, client, oauth, graph_key, sync_minutes).await;
+        return server::serve(bind, client, oauth, sync_minutes).await;
     }
 
     let client = Client::new(resolve_token().context(

@@ -44,10 +44,8 @@ Config via env / `.env` — see `.env.example`.
 
 ## Graph view
 
-`GET https://tache.zach.network/graph?key=...` — read-only Mermaid
-rendering of all `#dag` projects, gated by a shared secret in the
-`TACHE_GRAPH_KEY` env var. When the var is unset the endpoint returns
-503; a wrong key returns 403.
+`GET https://tache.zach.network/` — public read-only Graphviz rendering
+of all `#dag` projects, one tab per project.
 
 ## Deployment
 

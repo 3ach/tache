@@ -1,4 +1,4 @@
-//! Renders /graph HTML from fixture data shaped like the real Library
+//! Renders the graph page HTML from fixture data shaped like the real Library
 //! project — many parallel build chains converging on one install hub —
 //! so layout/pan-zoom changes can be eyeballed without a Todoist token:
 //!

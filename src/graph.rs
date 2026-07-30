@@ -1,4 +1,4 @@
-//! Read-only HTML view of the dependency graph (GET /graph).
+//! Read-only HTML view of the dependency graph, served at the root.
 //!
 //! Renders every `#dag` project's active tasks as its own left-to-right
 //! Graphviz digraph behind a vanilla-JS tab bar — one tab per project,
@@ -11,8 +11,7 @@
 //! double-click toggles between fit-width and fit-all). The server
 //! emits static HTML with DOT source per pane; layout runs client-side
 //! via @viz-js/viz (Graphviz compiled to WASM, one self-contained ESM
-//! from jsdelivr). Gated by TACHE_GRAPH_KEY since task contents are
-//! personal.
+//! from jsdelivr). Public: no auth, the page is deliberately shareable.
 //!
 //! Sizing: the DOT carries no size/ratio — those depend on the client's
 //! viewport, so the page computes the pane's aspect at render time and
