@@ -12,8 +12,10 @@
 //! Cross-project edges show the external endpoint as a dashed "ghost"
 //! node labeled with its name and project. Charts render lazily on
 //! first tab activation into a pan/zoom pane (wheel zooms at the
-//! cursor, drag pans; initial view is fit-to-width and top-aligned,
-//! double-click toggles between fit-width and fit-all). The server
+//! cursor, drag pans; on touch one finger pans, two pinch-zoom, and
+//! double-tap replaces double-click; initial view is fit-to-width and
+//! top-aligned, double-click/tap toggles fit-width and fit-all). The
+//! server
 //! emits static HTML with DOT source per pane; layout runs client-side
 //! via @viz-js/viz (Graphviz compiled to WASM, one self-contained ESM
 //! from jsdelivr). Public: no auth, the page is deliberately shareable.
@@ -154,17 +156,66 @@ for (const pane of document.querySelectorAll(".pane")) {{
     v.k = k;
     apply(pane);
   }}, {{ passive: false }});
-  pane.addEventListener("pointerdown", (e) => {{
+  // Touch pointers: one drags, two pinch-zoom. The Map holds live
+  // pointers in pane coords; every down/up re-baselines the gesture
+  // from the current view, so drag→pinch→drag transitions don't jump.
+  const pointers = new Map();
+  let base = null, moved = false;
+  const at = (e) => {{
+    const r = pane.getBoundingClientRect();
+    return {{ x: e.clientX - r.left, y: e.clientY - r.top }};
+  }};
+  const centroid = () => {{
+    const pts = [...pointers.values()];
+    const c = pts.reduce((s, p) => ({{ x: s.x + p.x, y: s.y + p.y }}), {{ x: 0, y: 0 }});
+    return {{ x: c.x / pts.length, y: c.y / pts.length,
+             d: pts.length > 1 ? Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) : 0 }};
+  }};
+  const rebase = () => {{
     const v = views.get(pane.id);
-    if (!v || e.button !== 0) return;
+    base = v && pointers.size ? {{ v: {{ ...v }}, c: centroid() }} : null;
+  }};
+  pane.addEventListener("pointerdown", (e) => {{
+    if (!views.get(pane.id) || (e.pointerType === "mouse" && e.button !== 0)) return;
     e.preventDefault();
     pane.setPointerCapture(e.pointerId);
-    const sx = e.clientX - v.x, sy = e.clientY - v.y;
-    const move = (m) => {{ v.x = m.clientX - sx; v.y = m.clientY - sy; apply(pane); }};
-    pane.addEventListener("pointermove", move);
-    pane.addEventListener("pointerup",
-      () => pane.removeEventListener("pointermove", move), {{ once: true }});
+    if (!pointers.size) moved = false;
+    pointers.set(e.pointerId, at(e));
+    rebase();
   }});
+  pane.addEventListener("pointermove", (e) => {{
+    if (!pointers.has(e.pointerId) || !base) return;
+    pointers.set(e.pointerId, at(e));
+    const v = views.get(pane.id);
+    const c = centroid();
+    if (pointers.size > 1 || Math.hypot(c.x - base.c.x, c.y - base.c.y) > 8) moved = true;
+    // Same anchor math as wheel zoom: scale by the pinch-distance ratio
+    // and keep the content point under the gesture's start centroid
+    // pinned to the current one (one pointer reduces to a plain drag).
+    const k = base.c.d ? Math.min(Math.max((base.v.k * c.d) / base.c.d, 0.05), 8) : base.v.k;
+    v.k = k;
+    v.x = c.x - ((base.c.x - base.v.x) * k) / base.v.k;
+    v.y = c.y - ((base.c.y - base.v.y) * k) / base.v.k;
+    apply(pane);
+  }});
+  // Double-tap stands in for dblclick on touch, where the pointerdown
+  // preventDefault stops the browser from synthesizing one.
+  let tap = null;
+  const up = (e) => {{
+    if (!pointers.delete(e.pointerId)) return;
+    rebase();
+    if (e.pointerType === "mouse" || pointers.size) return;
+    const p = at(e);
+    if (!moved && tap && e.timeStamp - tap.t < 350 &&
+        Math.hypot(p.x - tap.x, p.y - tap.y) < 40) {{
+      fit(pane, modes.get(pane.id) === "width" ? "all" : "width");
+      tap = null;
+    }} else {{
+      tap = moved ? null : {{ t: e.timeStamp, x: p.x, y: p.y }};
+    }}
+  }};
+  pane.addEventListener("pointerup", up);
+  pane.addEventListener("pointercancel", up);
   pane.addEventListener("dblclick", () =>
     fit(pane, modes.get(pane.id) === "width" ? "all" : "width"));
 }}
