@@ -118,10 +118,16 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| id.to_string())
             };
             for (id, r) in &dag.unresolved {
-                println!("unresolved  {}: after: {r}  (completed prereq or typo)", name(id));
+                println!(
+                    "unresolved  {}: after: {r}  (completed prereq or typo)",
+                    name(id)
+                );
             }
             for (id, r) in &dag.ambiguous {
-                println!("ambiguous   {}: after: {r}  (matches multiple tasks)", name(id));
+                println!(
+                    "ambiguous   {}: after: {r}  (matches multiple tasks)",
+                    name(id)
+                );
             }
             for id in dag.cycle_members() {
                 println!("cycle       {}", name(&id));
@@ -167,7 +173,10 @@ async fn main() -> Result<()> {
                 }
                 client.set_description(&target.id, &desc).await?;
                 if cross_project {
-                    println!("added: {} after {} (cross-project, by id)", target.content, p.content);
+                    println!(
+                        "added: {} after {} (cross-project, by id)",
+                        target.content, p.content
+                    );
                 } else {
                     println!("added: {} after {}", target.content, p.content);
                 }
@@ -189,7 +198,11 @@ fn resolve_token() -> Option<String> {
         .map(|t| t.trim().to_string())
         .ok()
         .filter(|t| !t.is_empty())
-        .or_else(|| std::env::var("TODOIST_API_TOKEN").ok().filter(|t| !t.is_empty()))
+        .or_else(|| {
+            std::env::var("TODOIST_API_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
 }
 
 fn find_unique<'a>(tasks: &'a [todoist::Task], query: &str) -> Result<&'a todoist::Task> {

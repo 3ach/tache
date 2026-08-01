@@ -131,6 +131,26 @@ fn main() {
         "lib",
     ));
 
+    // Due dates: fixed values far in the past/future so the preview
+    // looks the same whenever it is rendered — one overdue frontier
+    // head (red), one upcoming (muted, current-ish year), one blocked
+    // with a date (gray), one cross-year (shows the year), and one on
+    // a wrapped long-name node.
+    let dues = [
+        ("c1s0", "2020-03-01"),          // overdue
+        ("c2s0", "2099-08-05"),          // upcoming, cross-year
+        ("c1s2", "2099-09-12T14:30:00"), // blocked, with time-of-day tail
+        ("hub", "2099-12-24"),
+        ("long0", "2020-11-30"), // overdue on a wrapped label
+    ];
+    for (id, date) in dues {
+        let t = tasks
+            .iter_mut()
+            .find(|t| t.id == id)
+            .expect("due fixture id");
+        t.due = Some(tache::todoist::Due { date: date.into() });
+    }
+
     let dag = Dag::build(&tasks);
     let classes = dag.classify(&tasks);
     let html = graph::page(&projects, &tasks, &dag, &classes);

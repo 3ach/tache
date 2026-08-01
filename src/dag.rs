@@ -144,7 +144,13 @@ impl Dag {
 
         for id in self.prereqs.keys() {
             if color.get(id.as_str()).copied().unwrap_or(Color::White) == Color::White {
-                visit(id, &self.prereqs, &mut color, &mut Vec::new(), &mut in_cycle);
+                visit(
+                    id,
+                    &self.prereqs,
+                    &mut color,
+                    &mut Vec::new(),
+                    &mut in_cycle,
+                );
             }
         }
         in_cycle
@@ -169,7 +175,10 @@ impl Dag {
                         .prereqs
                         .get(&t.id)
                         .is_some_and(|ps| ps.iter().any(|p| active.contains(p.as_str())));
-                (t.id.clone(), if blocked { LABEL_BLOCKED } else { LABEL_NEXT })
+                (
+                    t.id.clone(),
+                    if blocked { LABEL_BLOCKED } else { LABEL_NEXT },
+                )
             })
             .collect()
     }
@@ -216,7 +225,10 @@ mod tests {
         assert_eq!(classes["3"], LABEL_BLOCKED);
         assert_eq!(classes["4"], LABEL_NEXT);
         assert_eq!(classes["5"], LABEL_NEXT);
-        assert_eq!(dag.unresolved, vec![("5".to_string(), "order brackets".to_string())]);
+        assert_eq!(
+            dag.unresolved,
+            vec![("5".to_string(), "order brackets".to_string())]
+        );
     }
 
     #[test]

@@ -53,12 +53,7 @@ struct AppState {
     kick: mpsc::Sender<()>,
 }
 
-pub async fn serve(
-    bind: &str,
-    client: Arc<Client>,
-    oauth: Oauth,
-    sync_minutes: u64,
-) -> Result<()> {
+pub async fn serve(bind: &str, client: Arc<Client>, oauth: Oauth, sync_minutes: u64) -> Result<()> {
     if oauth.client_secret.is_empty() {
         tracing::warn!(
             "TODOIST_CLIENT_SECRET is empty — all webhooks will be rejected until it is set"
@@ -149,7 +144,11 @@ async fn hook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Byte
 async fn graph_view(State(state): State<Arc<AppState>>) -> axum::response::Response {
     match render_graph(&state.client).await {
         Ok(html) => axum::response::Html(html).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("todoist fetch failed: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("todoist fetch failed: {e}"),
+        )
+            .into_response(),
     }
 }
 

@@ -3,7 +3,12 @@
 //! Renders every `#dag` project's active tasks as its own left-to-right
 //! Graphviz digraph behind a vanilla-JS tab bar — one tab per project,
 //! nodes colored by frontier status, edges pointing prerequisite →
-//! dependent.
+//! dependent. Tasks with a due date get a second, smaller label line
+//! ("due Aug 5" — year appended only when it differs from the current
+//! one, red when the date is past). Overdue-ness compares against UTC
+//! today, which can disagree with the user's local date near midnight;
+//! close enough for a glanceable view. Ghost nodes stay name-only —
+//! they are de-emphasized context, not actionable rows.
 //! Cross-project edges show the external endpoint as a dashed "ghost"
 //! node labeled with its name and project. Charts render lazily on
 //! first tab activation into a pan/zoom pane (wheel zooms at the
@@ -27,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dag::{Dag, LABEL_NEXT};
-use crate::todoist::{Project, Task};
+use crate::todoist::{Due, Project, Task};
 
 pub fn page(
     projects: &[Project],
@@ -37,8 +42,9 @@ pub fn page(
 ) -> String {
     let mut tabs = String::new();
     let mut panes = String::new();
+    let today = today_utc();
     for p in projects {
-        let Some(chart) = project_chart(p, projects, tasks, dag, classes) else {
+        let Some(chart) = project_chart(p, projects, tasks, dag, classes, today) else {
             continue;
         };
         let title = escape(display_name(p));
@@ -219,8 +225,12 @@ fn project_chart(
     tasks: &[Task],
     dag: &Dag,
     classes: &HashMap<String, &'static str>,
+    today: (i32, u32, u32),
 ) -> Option<String> {
-    let members: Vec<&Task> = tasks.iter().filter(|t| t.project_id == project.id).collect();
+    let members: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.project_id == project.id)
+        .collect();
     if members.is_empty() {
         return None;
     }
@@ -243,7 +253,8 @@ fn project_chart(
     // Per-status node attributes, the DOT equivalent of the old Mermaid
     // classDefs. `class=` carries through to the SVG for debugging and
     // tests; the inline attrs do the actual styling.
-    const NEXT: &str = r##"class="next", fillcolor="#c8e6c9", color="#2e7d32", fontcolor="#1b5e20""##;
+    const NEXT: &str =
+        r##"class="next", fillcolor="#c8e6c9", color="#2e7d32", fontcolor="#1b5e20""##;
     const BLOCKED: &str =
         r##"class="blocked", fillcolor="#eceff1", color="#b0bec5", fontcolor="#78909c""##;
     const GHOST: &str = r##"class="ghost", style="filled,rounded,dashed", fillcolor="#fafafa", color="#90a4ae", fontcolor="#90a4ae""##;
@@ -273,14 +284,16 @@ fn project_chart(
     out.push_str("  edge [color=\"#90a4ae\", arrowsize=0.8, fontname=\"Helvetica\"]\n");
 
     for t in &members {
-        let attrs = match classes.get(&t.id).copied() {
-            Some(LABEL_NEXT) => NEXT,
-            _ => BLOCKED,
+        // Due-line color tracks the node's palette (medium green on
+        // next, gray on blocked) so the date reads as secondary text.
+        let (attrs, due_color) = match classes.get(&t.id).copied() {
+            Some(LABEL_NEXT) => (NEXT, "#558b2f"),
+            _ => (BLOCKED, "#90a4ae"),
         };
         out.push_str(&format!(
-            "  T{} [label=\"{}\", {attrs}]\n",
+            "  T{} [{}, {attrs}]\n",
             t.id,
-            label(&t.content)
+            node_label(&t.content, t.due.as_ref(), due_color, today)
         ));
     }
 
@@ -337,6 +350,93 @@ fn ghost_label(
 /// Wrap threshold: graphviz never wraps labels itself, so lines longer
 /// than this many chars break at word boundaries server-side.
 const WRAP_COLS: usize = 30;
+
+/// The full `label=...` attribute for a task node. Without a due date
+/// this is the plain double-quoted label; with one it becomes an
+/// HTML-like label (`label=<...>`) so the date line can drop to a
+/// smaller point size and its own color — quoted labels are single-font.
+///
+/// HTML-like labels escape differently from quoted ones: backslashes
+/// and quotes are literal, but text runs through graphviz's own entity
+/// decoding, so content is entity-escaped once for graphviz and the
+/// whole label (tags, attributes and all — including the `<`/`>`
+/// delimiters around it) once more for the `<pre>` transport. `escape()`
+/// serves both layers; double-escaped text like `&amp;amp;` decodes to
+/// `&amp;` in textContent, which graphviz then reads as `&`.
+fn node_label(content: &str, due: Option<&Due>, due_color: &str, today: (i32, u32, u32)) -> String {
+    let Some(due) = due else {
+        return format!("label=\"{}\"", label(content));
+    };
+    // Unparseable dates (nothing Todoist currently emits) fall back to
+    // the raw string, shown muted rather than dropped.
+    let (text, overdue) = match parse_iso_date(&due.date) {
+        Some(d) => (format_due(d, today), d < today),
+        None => (due.date.clone(), false),
+    };
+    let color = if overdue { "#c62828" } else { due_color };
+    let name = wrap(content, WRAP_COLS)
+        .iter()
+        .map(|line| escape(line))
+        .collect::<Vec<_>>()
+        .join("<BR/>");
+    let html = format!(
+        "{name}<BR/><FONT POINT-SIZE=\"10\" COLOR=\"{color}\">due {}</FONT>",
+        escape(&text)
+    );
+    format!("label=&lt;{}&gt;", escape(&html))
+}
+
+/// (year, month, day) from the leading `YYYY-MM-DD` of a Todoist due
+/// date, which may carry a `THH:MM:SS` tail; None on anything malformed.
+fn parse_iso_date(s: &str) -> Option<(i32, u32, u32)> {
+    let b = s.as_bytes();
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') {
+        return None;
+    }
+    let y = s.get(0..4)?.parse().ok()?;
+    let m: u32 = s.get(5..7)?.parse().ok()?;
+    let d: u32 = s.get(8..10)?.parse().ok()?;
+    ((1..=12).contains(&m) && (1..=31).contains(&d)).then_some((y, m, d))
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// "Aug 5", or "Aug 5 2027" when the year isn't today's — the common
+/// case stays terse and cross-year dates stay unambiguous.
+fn format_due(due: (i32, u32, u32), today: (i32, u32, u32)) -> String {
+    let (y, m, d) = due;
+    let month = MONTHS[(m - 1) as usize];
+    if y == today.0 {
+        format!("{month} {d}")
+    } else {
+        format!("{month} {d} {y}")
+    }
+}
+
+/// Today's UTC civil date, no chrono: epoch seconds → days →
+/// year/month/day via Howard Hinnant's civil_from_days algorithm.
+fn today_utc() -> (i32, u32, u32) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    civil_from_days((secs / 86_400) as i64)
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y as i32, m, d)
+}
 
 /// Wrap + escape for a DOT double-quoted label inside a `<pre>` block.
 ///
@@ -399,6 +499,8 @@ fn escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    const TODAY: (i32, u32, u32) = (2026, 8, 1);
+
     fn task(id: &str, content: &str, description: &str, project_id: &str) -> Task {
         Task {
             id: id.into(),
@@ -408,6 +510,12 @@ mod tests {
             project_id: project_id.into(),
             due: None,
         }
+    }
+
+    fn due_task(id: &str, content: &str, description: &str, project_id: &str, date: &str) -> Task {
+        let mut t = task(id, content, description, project_id);
+        t.due = Some(Due { date: date.into() });
+        t
     }
 
     fn project(id: &str, name: &str) -> Project {
@@ -427,7 +535,7 @@ mod tests {
         ];
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
-        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         assert!(chart.starts_with("digraph {"));
         assert!(chart.trim_end().ends_with('}'));
         assert!(chart.contains("rankdir=LR"));
@@ -445,7 +553,7 @@ mod tests {
         let tasks = vec![task("1", "glue A\\B <&> \"joints\"", "", "p1")];
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
-        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         // Backslash and quote are DOT-escaped; &, <, > are HTML entities
         // (the browser decodes them back before viz parses the DOT).
         assert!(chart.contains(r#"label="glue A\\B &lt;&amp;&gt; \"joints\"""#));
@@ -462,11 +570,13 @@ mod tests {
         )];
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
-        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         // Greedy 30-col wrap; the literal \n survives to graphviz.
-        assert!(chart.contains(
-            r#"label="Apply second finish coat to\nthe corner-lower cabinet\ncarcass""#
-        ));
+        assert!(
+            chart.contains(
+                r#"label="Apply second finish coat to\nthe corner-lower cabinet\ncarcass""#
+            )
+        );
     }
 
     #[test]
@@ -492,10 +602,114 @@ mod tests {
     }
 
     #[test]
+    fn due_dates_render_as_smaller_second_line() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![
+            due_task("1", "buy lumber", "", "p1", "2026-08-05"),
+            task("2", "sand boards", "after: buy lumber", "p1"),
+        ];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
+        // HTML-like label, double-escaped for the <pre> transport: the
+        // `label=<...>` delimiters and tags arrive entity-escaped, the
+        // due line sits in a smaller status-colored FONT span.
+        assert!(chart.contains(
+            "T1 [label=&lt;buy lumber&lt;BR/&gt;&lt;FONT POINT-SIZE=&quot;10&quot; \
+             COLOR=&quot;#558b2f&quot;&gt;due Aug 5&lt;/FONT&gt;&gt;, class=\"next\""
+        ));
+        // Due-less tasks keep the plain quoted label.
+        assert!(chart.contains("T2 [label=\"sand boards\", class=\"blocked\""));
+    }
+
+    #[test]
+    fn overdue_dates_render_red() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![due_task("1", "buy lumber", "", "p1", "2026-07-20")];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
+        assert!(chart.contains("COLOR=&quot;#c62828&quot;&gt;due Jul 20&lt;"));
+    }
+
+    #[test]
+    fn due_line_color_tracks_blocked_status() {
+        let projects = vec![project("p1", "Shop")];
+        let tasks = vec![
+            task("1", "buy lumber", "", "p1"),
+            due_task("2", "sand boards", "after: buy lumber", "p1", "2026-08-09"),
+        ];
+        let dag = Dag::build(&tasks);
+        let classes = dag.classify(&tasks);
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
+        assert!(chart.contains("COLOR=&quot;#90a4ae&quot;&gt;due Aug 9&lt;"));
+    }
+
+    #[test]
+    fn due_dates_outside_current_year_show_the_year() {
+        assert_eq!(format_due((2027, 1, 15), TODAY), "Jan 15 2027");
+        assert_eq!(format_due((2026, 8, 5), TODAY), "Aug 5");
+    }
+
+    #[test]
+    fn due_content_is_double_escaped_in_html_labels() {
+        let out = node_label(
+            "glue & clamp",
+            Some(&Due {
+                date: "2026-08-05".into(),
+            }),
+            "#558b2f",
+            TODAY,
+        );
+        // & escapes once for graphviz's entity decoding, once more for
+        // the <pre> transport.
+        assert!(out.contains("glue &amp;amp; clamp"));
+    }
+
+    #[test]
+    fn unparseable_due_dates_fall_back_to_raw_text() {
+        let out = node_label(
+            "buy lumber",
+            Some(&Due {
+                date: "someday".into(),
+            }),
+            "#558b2f",
+            TODAY,
+        );
+        assert!(out.contains("due someday"));
+        assert!(!out.contains("#c62828"));
+    }
+
+    #[test]
+    fn iso_dates_parse_with_and_without_time() {
+        assert_eq!(parse_iso_date("2026-08-05"), Some((2026, 8, 5)));
+        assert_eq!(parse_iso_date("2026-08-05T14:30:00"), Some((2026, 8, 5)));
+        assert_eq!(parse_iso_date("someday"), None);
+        assert_eq!(parse_iso_date("2026/08/05"), None);
+        assert_eq!(parse_iso_date("2026-13-05"), None);
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20666), (2026, 8, 1));
+        // Leap day.
+        assert_eq!(civil_from_days(19782), (2024, 2, 29));
+    }
+
+    #[test]
     fn skips_projects_without_tasks() {
         let projects = vec![project("empty", "Empty")];
         assert!(
-            project_chart(&projects[0], &projects, &[], &Dag::default(), &HashMap::new()).is_none()
+            project_chart(
+                &projects[0],
+                &projects,
+                &[],
+                &Dag::default(),
+                &HashMap::new(),
+                TODAY
+            )
+            .is_none()
         );
     }
 
@@ -510,14 +724,14 @@ mod tests {
         let classes = dag.classify(&tasks);
 
         // Prereq's tab: dependent appears as a ghost.
-        let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         assert!(shop.contains("T1 [label=\"build cabinet\", class=\"next\""));
         assert!(shop.contains("G2 [label=\"install cabinet (House)\", class=\"ghost\""));
         assert!(shop.contains("T1 -> G2 [style=dashed]"));
         assert!(!shop.contains("T2 [label=\"install cabinet\""));
 
         // Dependent's tab: prerequisite appears as a ghost.
-        let house = project_chart(&projects[1], &projects, &tasks, &dag, &classes).unwrap();
+        let house = project_chart(&projects[1], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         assert!(house.contains("T2 [label=\"install cabinet\", class=\"blocked\""));
         assert!(house.contains("G1 [label=\"build cabinet (Shop)\", class=\"ghost\""));
         assert!(house.contains("G1 -> T2 [style=dashed]"));
@@ -534,7 +748,7 @@ mod tests {
         ];
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
-        let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        let shop = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         assert_eq!(shop.matches("G3 [label=").count(), 1);
         assert!(shop.contains("T1 -> G3 [style=dashed]"));
         assert!(shop.contains("T2 -> G3 [style=dashed]"));
@@ -576,7 +790,7 @@ mod tests {
         ];
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
-        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         // No run-collapsing: every task in a blocked chain gets its own node.
         assert!(chart.contains("T1 [label=\"assemble\", class=\"next\""));
         assert!(chart.contains("T2 [label=\"sand\", class=\"blocked\""));
@@ -604,7 +818,7 @@ mod tests {
         ));
         let dag = Dag::build(&tasks);
         let classes = dag.classify(&tasks);
-        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes).unwrap();
+        let chart = project_chart(&projects[0], &projects, &tasks, &dag, &classes, TODAY).unwrap();
         assert!(chart.contains("T99 [label=\"install\", class=\"blocked\""));
         assert_eq!(chart.matches("-> T99").count(), n);
     }
