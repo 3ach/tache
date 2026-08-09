@@ -55,10 +55,14 @@ jobs:
           audience: ${{ vars.TS_AUDIENCE }}
           tags: tag:ci
 
+      - name: Resolve vapor address
+        id: vapor
+        run: echo "ip=$(tailscale ip -4 ${{ vars.VAPOR_HOST }})" >> "$GITHUB_OUTPUT"
+
       - name: Sync deploy script to vapor
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ vars.VAPOR_HOST }}
+          host: ${{ steps.vapor.outputs.ip }}
           username: ${{ vars.DROPLET_USER }}
           key: ${{ secrets.VAPOR_SSH_KEY }}
           source: deploy/droplet/deploy-main.sh
@@ -70,7 +74,7 @@ jobs:
         env:
           IMAGE: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.tag }}
         with:
-          host: ${{ vars.VAPOR_HOST }}
+          host: ${{ steps.vapor.outputs.ip }}
           username: ${{ vars.DROPLET_USER }}
           key: ${{ secrets.VAPOR_SSH_KEY }}
           envs: IMAGE
