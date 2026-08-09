@@ -1,0 +1,51 @@
+name: vigie
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore last state
+        uses: actions/cache/restore@v4
+        with:
+          path: last_state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Probe vapor tunnel
+        id: probe
+        run: |
+          status=down
+          for i in 1 2 3; do
+            if curl -fsS -m 15 https://vapor-test.zach.network/ | grep -q "vapor ok"; then
+              status=up; break
+            fi
+            sleep 20
+          done
+          prev=$(cat last_state 2>/dev/null || echo up)
+          echo "$status" > last_state
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Alert on transition
+        if: steps.probe.outputs.status != steps.probe.outputs.prev
+        env:
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ "${{ steps.probe.outputs.status }}" = "down" ]; then
+            curl -s -H "Title: Mac Mini is OFFLINE" -H "Priority: urgent" -H "Tags: rotating_light" \
+              -d "The vapor tunnel is unreachable from GitHub. The mini (and everything on it) is likely down." "https://ntfy.sh/$TOPIC"
+          else
+            curl -s -H "Title: Back online" -H "Tags: white_check_mark" \
+              -d "The vapor tunnel is reachable again." "https://ntfy.sh/$TOPIC"
+          fi
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: last_state
+          key: state-${{ github.run_id }}
