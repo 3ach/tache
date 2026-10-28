@@ -64,7 +64,7 @@ jobs:
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ steps.vapor.outputs.ip }}
-          username: ${{ vars.DROPLET_USER }}
+          username: ${{ vars.VAPOR_USER }}
           key: ${{ secrets.VAPOR_SSH_KEY }}
           source: deploy/droplet/deploy-main.sh
           target: /home/zach/tache/bin/
@@ -76,7 +76,7 @@ jobs:
           IMAGE: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.tag }}
         with:
           host: ${{ steps.vapor.outputs.ip }}
-          username: ${{ vars.DROPLET_USER }}
+          username: ${{ vars.VAPOR_USER }}
           key: ${{ secrets.VAPOR_SSH_KEY }}
           envs: IMAGE
           command_timeout: 10m
